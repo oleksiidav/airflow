@@ -16,22 +16,32 @@
 # under the License.
 from __future__ import annotations
 
+import logging
+import os
+import time
+
 import pytest as pytest
 
 from airflow import AirflowException
 from airflow.jobs.job import Job, run_job
+from airflow.jobs.local_task_job_runner import LocalTaskJobRunner
 from airflow.listeners.listener import get_listener_manager
+from airflow.models import DagBag, TaskInstance
 from airflow.operators.bash import BashOperator
+from airflow.task.task_runner.standard_task_runner import StandardTaskRunner
 from airflow.utils import timezone
 from airflow.utils.session import provide_session
-from airflow.utils.state import DagRunState, TaskInstanceState
+from airflow.utils.state import DagRunState, State, TaskInstanceState
+from airflow.utils.timeout import timeout
 from tests.listeners import (
     class_listener,
     full_listener,
     lifecycle_listener,
     partial_listener,
     throwing_listener,
+    xcom_listener,
 )
+from tests.models import DEFAULT_DATE
 from tests.utils.test_helpers import MockJobRunner
 
 LISTENERS = [
@@ -45,6 +55,8 @@ LISTENERS = [
 DAG_ID = "test_listener_dag"
 TASK_ID = "test_listener_task"
 EXECUTION_DATE = timezone.utcnow()
+
+TEST_DAG_FOLDER = os.environ["AIRFLOW__CORE__DAGS_FOLDER"]
 
 
 @pytest.fixture(autouse=True)
@@ -163,3 +175,56 @@ def test_class_based_listener(create_task_instance, session=None):
 
     assert len(listener.state) == 2
     assert listener.state == [TaskInstanceState.RUNNING, TaskInstanceState.SUCCESS]
+
+
+def test_ol_does_not_block_xcoms():
+    """
+    Test that ensures that where a task is marked success in the UI
+    on_success_callback gets executed
+    """
+
+    path_listener_writer = "/tmp/test_ol_does_not_block_xcoms"
+    try:
+        os.unlink(path_listener_writer)
+    except OSError:
+        pass
+
+    listener = xcom_listener.XComListener(path_listener_writer, "push_and_pull")
+    get_listener_manager().add_listener(listener)
+    log = logging.getLogger("airflow")
+
+    dagbag = DagBag(
+        dag_folder=TEST_DAG_FOLDER,
+        include_examples=False,
+    )
+    dag = dagbag.dags.get("test_dag_xcom_openlineage")
+    task = dag.get_task("push_and_pull")
+    dag.create_dagrun(
+        run_id="test",
+        data_interval=(DEFAULT_DATE, DEFAULT_DATE),
+        state=State.RUNNING,
+        start_date=DEFAULT_DATE,
+    )
+
+    ti = TaskInstance(task=task, run_id="test")
+    job = Job(dag_id=ti.dag_id)
+    job_runner = LocalTaskJobRunner(job=job, task_instance=ti, ignore_ti_state=True)
+    task_runner = StandardTaskRunner(job_runner)
+    task_runner.start()
+
+    # Wait until process makes itself the leader of its own process group
+    with timeout(seconds=1):
+        while True:
+            runner_pgid = os.getpgid(task_runner.process.pid)
+            if runner_pgid == task_runner.process.pid:
+                break
+            time.sleep(0.01)
+
+    # Wait till process finishes
+    assert task_runner.return_code(timeout=10) is not None
+    log.error(task_runner.return_code())
+
+    with open(path_listener_writer) as f:
+        assert f.readline() == "on_task_instance_running\n"
+        assert f.readline() == "on_task_instance_success\n"
+        assert f.readline() == "listener\n"
